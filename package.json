@@ -1,0 +1,16 @@
+{
+  "name": "vbucks-robux-bot",
+  "version": "1.0.0",
+  "description": "V-Bucks & Robux Trading Discord Bot",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "express": "^4.21.0",
+    "dotenv": "^16.4.5"
+  }
+}
