@@ -1,27 +1,24 @@
-import { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from 'discord.js';
-import { createClient } from '@supabase/supabase-js';
+import 'dotenv/config';
 import express from 'express';
-import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
+import {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  PermissionFlagsBits,
+  MessageFlags,
+} from 'discord.js';
 
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => res.send('ok'));
-app.listen(PORT, () => console.log(`Health server running on port ${PORT}`));
-
-// Keep Render awake
-setInterval(() => {
-  fetch('https://shop31115154134514.onrender.com')
-    .then(() => console.log('Keep-alive ping sent'))
-    .catch(err => console.error('Keep-alive failed:', err.message));
-}, 5 * 60 * 1000);
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
+// ---------- env ----------
 const {
   DISCORD_TOKEN,
   DISCORD_CLIENT_ID,
@@ -30,204 +27,387 @@ const {
   APPROVAL_CHANNEL_ID,
   SUPABASE_URL,
   SUPABASE_SERVICE_ROLE_KEY,
-  PAYPAL_LINK = "https://paypal.com",
-  VBUCKS_ACCOUNTS,
-  ROBUX_STOCK = "50000"
+  PAYPAL_LINK = 'coming-soon',
+  PORT = 3000,
 } = process.env;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+function need(name, v) {
+  if (!v) console.warn(`[warn] missing env var ${name}`);
+}
+for (const [k, v] of Object.entries({
+  DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, ADMIN_ROLE_ID,
+  APPROVAL_CHANNEL_ID, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+})) need(k, v);
 
-const getVbucksStock = () => {
-  if (!VBUCKS_ACCOUNTS) return [];
-  return VBUCKS_ACCOUNTS.split(',').map(item => {
-    const [name, balance] = item.split(':');
-    return { name: name.trim(), balance: parseInt(balance) || 0 };
-  });
-};
+// ---------- express keepalive ----------
+const app = express();
+app.get('/', (_req, res) => res.send('ok'));
+app.listen(PORT, () => console.log(`[http] listening on ${PORT}`));
 
-const isAdmin = (interaction) => interaction.member?.roles.cache.has(ADMIN_ROLE_ID);
+// ---------- supabase ----------
+const sb = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
 
-async function getUser(discordId) {
-  let { data, error } = await supabase.from('users').select('*').eq('discord_id', discordId).single();
-  if (error && error.code === 'PGRST116') {
-    const { data: newUser } = await supabase.from('users').insert({ discord_id: discordId }).select().single();
-    return newUser;
-  }
-  return data;
+async function getUser(discord_id) {
+  if (!sb) return { discord_id, vbucks_balance: 0, robux_balance: 0 };
+  const { data } = await sb.from('users').select('*').eq('discord_id', discord_id).maybeSingle();
+  if (data) return data;
+  const { data: ins } = await sb.from('users').insert({ discord_id }).select('*').single();
+  return ins;
 }
 
-// Slash Commands
+async function adjustBalance(discord_id, currency, delta) {
+  const u = await getUser(discord_id);
+  const col = currency === 'vbucks' ? 'vbucks_balance' : 'robux_balance';
+  const next = Math.max(0, (u[col] || 0) + delta);
+  await sb.from('users').update({ [col]: next, updated_at: new Date().toISOString() }).eq('discord_id', discord_id);
+  return next;
+}
+
+async function setBalance(discord_id, currency, value) {
+  await getUser(discord_id);
+  const col = currency === 'vbucks' ? 'vbucks_balance' : 'robux_balance';
+  await sb.from('users').update({ [col]: Math.max(0, value), updated_at: new Date().toISOString() }).eq('discord_id', discord_id);
+}
+
+// ---------- pricing ----------
+const VBUCKS_PACKS = [1000, 2000, 5000, 13500];
+const ROBUX_PACKS = [1000, 2000, 5000, 10000];
+const PRICE_PER_1K_VBUCKS = 2.10;
+const PRICE_PER_1K_ROBUX = 5.00;
+const GIFTCARD_VBUCKS = 2000;
+
+const fmtGBP = n => `£${Number(n).toFixed(2)}`;
+
+// ---------- slash commands ----------
 const commands = [
-  { name: 'balance', description: 'Check your balance' },
-  { name: 'buy', description: 'Buy V-Bucks or Robux', options: [
-    { name: 'vbucks', type: 1, description: 'Buy V-Bucks' },
-    { name: 'robux', type: 1, description: 'Buy Robux' }
-  ]},
-  { name: 'redeem', description: 'Redeem V-Bucks or Robux', options: [
-    { name: 'vbucks', type: 1, description: 'Redeem V-Bucks' },
-    { name: 'robux', type: 1, description: 'Redeem Robux' }
-  ]},
-  { name: 'history', description: 'View your last 10 transactions' },
-  { name: 'addbalance', description: 'Add balance (Admin)', options: [
-    { name: 'user', type: 6, description: 'User', required: true },
-    { name: 'currency', type: 3, description: 'vbucks or robux', required: true, choices: [{name:'V-Bucks',value:'vbucks'}, {name:'Robux',value:'robux'}] },
-    { name: 'amount', type: 4, description: 'Amount', required: true }
-  ]},
-  { name: 'removebalance', description: 'Remove balance (Admin)', options: [
-    { name: 'user', type: 6, description: 'User', required: true },
-    { name: 'currency', type: 3, description: 'vbucks or robux', required: true, choices: [{name:'V-Bucks',value:'vbucks'}, {name:'Robux',value:'robux'}] },
-    { name: 'amount', type: 4, description: 'Amount', required: true }
-  ]},
-  { name: 'setbalance', description: 'Set balance (Admin)', options: [
-    { name: 'user', type: 6, description: 'User', required: true },
-    { name: 'currency', type: 3, description: 'vbucks or robux', required: true, choices: [{name:'V-Bucks',value:'vbucks'}, {name:'Robux',value:'robux'}] },
-    { name: 'amount', type: 4, description: 'Amount', required: true }
-  ]}
-];
+  new SlashCommandBuilder().setName('balance').setDescription('Show your V-Bucks and Robux balance'),
+  new SlashCommandBuilder().setName('buy').setDescription('Buy currency')
+    .addSubcommand(s => s.setName('vbucks').setDescription('Buy V-Bucks'))
+    .addSubcommand(s => s.setName('robux').setDescription('Buy Robux')),
+  new SlashCommandBuilder().setName('redeem').setDescription('Redeem from your balance')
+    .addSubcommand(s => s.setName('vbucks').setDescription('Redeem V-Bucks on an item'))
+    .addSubcommand(s => s.setName('robux').setDescription('Redeem Robux')),
+  new SlashCommandBuilder().setName('history').setDescription('Show your last 10 transactions'),
+  new SlashCommandBuilder().setName('addbalance').setDescription('Admin: add balance to a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('currency').setDescription('vbucks or robux').setRequired(true)
+      .addChoices({ name: 'vbucks', value: 'vbucks' }, { name: 'robux', value: 'robux' }))
+    .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)),
+  new SlashCommandBuilder().setName('removebalance').setDescription('Admin: remove balance from a user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('currency').setDescription('vbucks or robux').setRequired(true)
+      .addChoices({ name: 'vbucks', value: 'vbucks' }, { name: 'robux', value: 'robux' }))
+    .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)),
+  new SlashCommandBuilder().setName('setbalance').setDescription('Admin: set a user balance')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('currency').setDescription('vbucks or robux').setRequired(true)
+      .addChoices({ name: 'vbucks', value: 'vbucks' }, { name: 'robux', value: 'robux' }))
+    .addIntegerOption(o => o.setName('amount').setDescription('Amount').setRequired(true)),
+].map(c => c.toJSON());
 
-client.once('ready', async () => {
-  console.log(`Bot is online as ${client.user.tag}`);
+async function registerCommands() {
+  if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !DISCORD_GUILD_ID) {
+    console.warn('[warn] skipping command registration — missing env');
+    return;
+  }
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
+  console.log('[discord] commands registered');
+}
+
+// ---------- client ----------
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.once('ready', () => console.log(`[discord] logged in as ${client.user.tag}`));
+
+function isAdmin(member) {
+  if (!member) return false;
+  if (ADMIN_ROLE_ID && member.roles?.cache?.has(ADMIN_ROLE_ID)) return true;
+  return !!member.permissions?.has(PermissionFlagsBits.Administrator);
+}
+
+async function ephem(i, content) {
+  return i.reply({ content, flags: MessageFlags.Ephemeral });
+}
+
+// ---------- approval channel post helpers ----------
+async function postOrderApproval(order, userTag) {
+  const ch = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+  const embed = new EmbedBuilder()
+    .setTitle(`🛒 New ${order.currency.toUpperCase()} order — pending`)
+    .setColor(0xf1c40f)
+    .addFields(
+      { name: 'User', value: `<@${order.discord_id}> (${userTag})`, inline: true },
+      { name: 'Amount', value: `${order.amount.toLocaleString()} ${order.currency}`, inline: true },
+      { name: 'Price', value: fmtGBP(order.price_gbp), inline: true },
+      { name: 'Payment', value: order.payment_method, inline: true },
+      { name: 'Order ID', value: `\`${order.id}\`` },
+    );
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`order:approve:${order.id}`).setLabel('✅ Payment Received').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`order:reject:${order.id}`).setLabel('❌ Reject').setStyle(ButtonStyle.Danger),
+  );
+  const msg = await ch.send({ embeds: [embed], components: [row] });
+  await sb.from('orders').update({ approval_msg_id: msg.id }).eq('id', order.id);
+}
+
+async function postRedemptionApproval(r, userTag) {
+  const ch = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+  const embed = new EmbedBuilder()
+    .setTitle(`🎁 New ${r.currency.toUpperCase()} redemption — pending`)
+    .setColor(0x3498db)
+    .addFields(
+      { name: 'User', value: `<@${r.discord_id}> (${userTag})`, inline: true },
+      { name: r.currency === 'vbucks' ? 'Epic Username' : 'Roblox Username', value: r.username, inline: true },
+      { name: 'Amount', value: `${r.amount.toLocaleString()} ${r.currency}`, inline: true },
+      ...(r.item ? [{ name: 'Item', value: r.item }] : []),
+      { name: 'Redemption ID', value: `\`${r.id}\`` },
+    );
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`redeem:approve:${r.id}`).setLabel('✅ Sent / Remove Balance').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`redeem:reject:${r.id}`).setLabel('❌ Reject').setStyle(ButtonStyle.Danger),
+  );
+  const msg = await ch.send({ embeds: [embed], components: [row] });
+  await sb.from('redemptions').update({ approval_msg_id: msg.id }).eq('id', r.id);
+}
+
+// ---------- interactions ----------
+client.on('interactionCreate', async (i) => {
   try {
-    await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
-    console.log('Slash commands registered.');
-  } catch (err) {
-    console.error(err);
+    if (i.isChatInputCommand()) return handleCommand(i);
+    if (i.isButton()) return handleButton(i);
+    if (i.isStringSelectMenu()) return handleSelect(i);
+    if (i.isModalSubmit()) return handleModal(i);
+  } catch (e) {
+    console.error(e);
+    if (i.isRepliable() && !i.replied && !i.deferred) {
+      try { await ephem(i, `Error: ${e.message || e}`); } catch {}
+    }
   }
 });
 
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
+async function handleCommand(i) {
+  const name = i.commandName;
 
-  const user = await getUser(interaction.user.id);
-
-  // Balance Command
-  if (interaction.commandName === 'balance') {
-    const embed = new EmbedBuilder()
-      .setColor(0x00b0f4)
-      .setTitle(`${interaction.user.username}'s Balance`)
-      .addFields(
-        { name: 'V-Bucks', value: user.vbucks_balance.toLocaleString(), inline: true },
-        { name: 'Robux', value: user.robux_balance.toLocaleString(), inline: true }
-      )
-      .setFooter({ text: `User ID: ${interaction.user.id}` })
-      .setTimestamp();
-
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+  if (name === 'balance') {
+    const u = await getUser(i.user.id);
+    return ephem(i, `**Your balance**\n• V-Bucks: ${u.vbucks_balance.toLocaleString()}\n• Robux: ${u.robux_balance.toLocaleString()}`);
   }
 
-  // Buy Command
-  if (interaction.commandName === 'buy') {
-    const sub = interaction.options.getSubcommand();
-    const isVbucks = sub === 'vbucks';
-
-    const embed = new EmbedBuilder()
-      .setColor(0x00b0f4)
-      .setTitle(isVbucks ? 'V-Bucks Shop' : 'Robux Shop')
-      .setDescription('Select the package you want to purchase:');
-
-    const select = new StringSelectMenuBuilder()
-      .setCustomId(isVbucks ? 'vb_pack_select' : 'rb_pack_select')
-      .setPlaceholder('Choose a package')
-      .addOptions(isVbucks ? [
-        { label: '1,000 V-Bucks — £2.10', value: '1000_2.10' },
-        { label: '2,000 V-Bucks — £4.20', value: '2000_4.20' },
-        { label: '5,000 V-Bucks — £10.50', value: '5000_10.50' },
-        { label: '13,500 V-Bucks — £28.35', value: '13500_28.35' }
-      ] : [
-        { label: '1,000 Robux — £5', value: '1000_5' },
-        { label: '2,000 Robux — £10', value: '2000_10' },
-        { label: '5,000 Robux — £25', value: '5000_25' },
-        { label: '10,000 Robux — £50', value: '10000_50' }
-      ]);
-
-    const row = new ActionRowBuilder().addComponents(select);
-    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
-  }
-
-  // Redeem Command
-  if (interaction.commandName === 'redeem') {
-    const sub = interaction.options.getSubcommand();
-
+  if (name === 'buy') {
+    const sub = i.options.getSubcommand();
     if (sub === 'vbucks') {
-      const accounts = getVbucksStock();
-      const stockText = accounts.map(a => `${a.name}: ${a.balance.toLocaleString()} V-Bucks`).join('\n') || "No accounts available.";
-
-      const embed = new EmbedBuilder()
-        .setColor(0x00b0f4)
-        .setTitle('Redeem V-Bucks')
-        .setDescription(`**Current Stock:**\n${stockText}`);
-
-      await interaction.reply({ embeds: [embed], ephemeral: true });
-
-      const modal = new ModalBuilder().setCustomId('redeem_vb_modal').setTitle('V-Bucks Redemption');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('epic_username').setLabel('Epic Username').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item_name').setLabel('Item Name').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('V-Bucks Amount').setStyle(TextInputStyle.Short).setRequired(true))
+      const row = new ActionRowBuilder().addComponents(
+        ...VBUCKS_PACKS.map(a => new ButtonBuilder()
+          .setCustomId(`buy:vbucks:pack:${a}`)
+          .setLabel(`${a.toLocaleString()} — ${fmtGBP((a / 1000) * PRICE_PER_1K_VBUCKS)}`)
+          .setStyle(ButtonStyle.Primary)),
       );
-      return interaction.showModal(modal);
+      const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('buy:vbucks:giftcard').setLabel(`🎟️ £10 Roblox Gift Card → ${GIFTCARD_VBUCKS} V-Bucks`).setStyle(ButtonStyle.Secondary),
+      );
+      return i.reply({ content: '**Buy V-Bucks** — pick a pack:', components: [row, row2], flags: MessageFlags.Ephemeral });
     }
-
     if (sub === 'robux') {
-      const stock = parseInt(ROBUX_STOCK) || 0;
-      const embed = new EmbedBuilder()
-        .setColor(0x00b0f4)
-        .setTitle('Redeem Robux')
-        .setDescription(`**Current Stock:** ${stock.toLocaleString()} Robux`);
-
-      await interaction.reply({ embeds: [embed], ephemeral: true });
-
-      const modal = new ModalBuilder().setCustomId('redeem_rb_modal').setTitle('Robux Redemption');
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('roblox_username').setLabel('Roblox Username').setStyle(TextInputStyle.Short).setRequired(true)),
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Robux Amount').setStyle(TextInputStyle.Short).setRequired(true))
+      const row = new ActionRowBuilder().addComponents(
+        ...ROBUX_PACKS.map(a => new ButtonBuilder()
+          .setCustomId(`buy:robux:pack:${a}`)
+          .setLabel(`${a.toLocaleString()} — ${fmtGBP((a / 1000) * PRICE_PER_1K_ROBUX)}`)
+          .setStyle(ButtonStyle.Primary)),
       );
-      return interaction.showModal(modal);
+      return i.reply({ content: '**Buy Robux** — pick a pack (PayPal):', components: [row], flags: MessageFlags.Ephemeral });
     }
   }
 
-  // History Command
-  if (interaction.commandName === 'history') {
-    const embed = new EmbedBuilder()
-      .setColor(0x0099ff)
-      .setTitle('Recent Transactions')
-      .setDescription('Last 10 transactions will appear here.');
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+  if (name === 'redeem') {
+    const sub = i.options.getSubcommand();
+    const u = await getUser(i.user.id);
+    if (sub === 'vbucks') {
+      if (u.vbucks_balance <= 0) return ephem(i, 'You have no V-Bucks balance.');
+      const modal = new ModalBuilder().setCustomId('modal:redeem:vbucks').setTitle('Redeem V-Bucks')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('epic').setLabel('Epic Games Username').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('item').setLabel('Item Name').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`Price in V-Bucks (you have ${u.vbucks_balance})`).setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      return i.showModal(modal);
+    }
+    if (sub === 'robux') {
+      if (u.robux_balance <= 0) return ephem(i, 'You have no Robux balance.');
+      const modal = new ModalBuilder().setCustomId('modal:redeem:robux').setTitle('Redeem Robux')
+        .addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('user').setLabel('Roblox Username').setStyle(TextInputStyle.Short).setRequired(true)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel(`Amount of Robux (you have ${u.robux_balance})`).setStyle(TextInputStyle.Short).setRequired(true)),
+        );
+      return i.showModal(modal);
+    }
   }
 
-  // Admin Commands (simplified)
-  if (['addbalance', 'removebalance', 'setbalance'].includes(interaction.commandName)) {
-    if (!isAdmin(interaction)) return interaction.reply({ content: 'Admin only.', ephemeral: true });
-    // Add your admin logic here if needed
-    return interaction.reply({ content: 'Command executed.', ephemeral: true });
+  if (name === 'history') {
+    const [{ data: orders = [] }, { data: reds = [] }] = await Promise.all([
+      sb.from('orders').select('*').eq('discord_id', i.user.id).order('created_at', { ascending: false }).limit(10),
+      sb.from('redemptions').select('*').eq('discord_id', i.user.id).order('created_at', { ascending: false }).limit(10),
+    ]);
+    const lines = [
+      '**Recent orders**',
+      ...(orders.length ? orders.map(o => `• ${new Date(o.created_at).toLocaleDateString()} — ${o.amount} ${o.currency} (${o.payment_method}) — ${o.status}`) : ['_none_']),
+      '',
+      '**Recent redemptions**',
+      ...(reds.length ? reds.map(r => `• ${new Date(r.created_at).toLocaleDateString()} — ${r.amount} ${r.currency} → ${r.username} — ${r.status}`) : ['_none_']),
+    ];
+    return ephem(i, lines.join('\n'));
   }
 
-  // Select Menu Handler (Pack Selection → Payment)
-  if (interaction.isStringSelectMenu()) {
-    const [amount, price] = interaction.values[0].split('_');
-    const isVbucks = interaction.customId.startsWith('vb');
-
-    const embed = new EmbedBuilder()
-      .setColor(0x00b0f4)
-      .setTitle(`Purchase ${amount} ${isVbucks ? 'V-Bucks' : 'Robux'}`)
-      .setDescription(`**Price:** £${price}\n\nPlease select your payment method:`);
-
-    const paymentOptions = isVbucks 
-      ? [
-          { label: 'PayPal', value: `paypal_${amount}` },
-          { label: '£10 Roblox Gift Card', value: `giftcard_${amount}` }
-        ]
-      : [{ label: 'PayPal', value: `paypal_${amount}` }];
-
-    const select = new StringSelectMenuBuilder()
-      .setCustomId(`payment_select_${isVbucks ? 'vb' : 'rb'}_${amount}`)
-      .setPlaceholder('Choose Payment Method')
-      .addOptions(paymentOptions);
-
-    const row = new ActionRowBuilder().addComponents(select);
-    return interaction.update({ embeds: [embed], components: [row] });
+  if (['addbalance', 'removebalance', 'setbalance'].includes(name)) {
+    if (!isAdmin(i.member)) return ephem(i, 'Admins only.');
+    const target = i.options.getUser('user');
+    const currency = i.options.getString('currency');
+    const amount = i.options.getInteger('amount');
+    if (amount < 0) return ephem(i, 'Amount must be ≥ 0.');
+    await getUser(target.id);
+    if (name === 'addbalance') await adjustBalance(target.id, currency, amount);
+    else if (name === 'removebalance') await adjustBalance(target.id, currency, -amount);
+    else await setBalance(target.id, currency, amount);
+    const u = await getUser(target.id);
+    const col = currency === 'vbucks' ? u.vbucks_balance : u.robux_balance;
+    return ephem(i, `✅ ${target.tag} ${currency} balance is now **${col.toLocaleString()}**.`);
   }
-});
+}
 
-client.login(DISCORD_TOKEN);
+async function handleButton(i) {
+  const id = i.customId;
+
+  // buy buttons
+  if (id.startsWith('buy:vbucks:pack:')) {
+    const amount = parseInt(id.split(':').pop(), 10);
+    const price = (amount / 1000) * PRICE_PER_1K_VBUCKS;
+    return sendPayPalPrompt(i, 'vbucks', amount, price);
+  }
+  if (id.startsWith('buy:robux:pack:')) {
+    const amount = parseInt(id.split(':').pop(), 10);
+    const price = (amount / 1000) * PRICE_PER_1K_ROBUX;
+    return sendPayPalPrompt(i, 'robux', amount, price);
+  }
+  if (id === 'buy:vbucks:giftcard') {
+    await getUser(i.user.id);
+    const { data: order } = await sb.from('orders').insert({
+      discord_id: i.user.id, currency: 'vbucks', amount: GIFTCARD_VBUCKS,
+      price_gbp: 10, payment_method: 'Roblox £10 Gift Card',
+    }).select('*').single();
+    await postOrderApproval(order, i.user.tag);
+    return ephem(i,
+      `🎟️ **Roblox £10 Gift Card → ${GIFTCARD_VBUCKS} V-Bucks**\nDM the gift card code to an admin. Once verified, **${GIFTCARD_VBUCKS}** V-Bucks will be credited to your balance.\nOrder ID: \`${order.id}\``);
+  }
+  if (id === 'buy:confirm:cancel') {
+    return i.update({ content: 'Cancelled.', components: [] });
+  }
+  if (id.startsWith('buy:confirm:')) {
+    // buy:confirm:<currency>:<amount>:<price>
+    const [, , currency, amountStr, priceStr] = id.split(':');
+    const amount = parseInt(amountStr, 10);
+    const price = parseFloat(priceStr);
+    await getUser(i.user.id);
+    const { data: order } = await sb.from('orders').insert({
+      discord_id: i.user.id, currency, amount, price_gbp: price, payment_method: 'PayPal',
+    }).select('*').single();
+    await postOrderApproval(order, i.user.tag);
+    return i.update({
+      content: `✅ Order placed. Pay **${fmtGBP(price)}** via PayPal: ${PAYPAL_LINK}\nOnce payment is confirmed by an admin, your balance will be credited.\nOrder ID: \`${order.id}\``,
+      components: [],
+    });
+  }
+
+  // approval buttons
+  if (id.startsWith('order:') || id.startsWith('redeem:')) {
+    if (!isAdmin(i.member)) return ephem(i, 'Admins only.');
+    const [kind, action, recordId] = id.split(':');
+    const table = kind === 'order' ? 'orders' : 'redemptions';
+    const { data: rec } = await sb.from(table).select('*').eq('id', recordId).single();
+    if (!rec) return ephem(i, 'Record not found.');
+    if (rec.status !== 'pending') return ephem(i, `Already ${rec.status}.`);
+
+    const status = action === 'approve' ? (kind === 'order' ? 'paid' : 'sent') : 'rejected';
+
+    if (action === 'approve') {
+      if (kind === 'order') {
+        await adjustBalance(rec.discord_id, rec.currency, rec.amount);
+      } else {
+        await adjustBalance(rec.discord_id, rec.currency, -rec.amount);
+      }
+    }
+
+    await sb.from(table).update({
+      status, actioned_by: i.user.id, actioned_at: new Date().toISOString(),
+    }).eq('id', recordId);
+
+    const oldEmbed = i.message.embeds[0];
+    const newEmbed = EmbedBuilder.from(oldEmbed)
+      .setColor(action === 'approve' ? 0x2ecc71 : 0xe74c3c)
+      .setTitle(`${oldEmbed.title.split(' — ')[0]} — ${status}`)
+      .addFields({ name: 'Actioned by', value: `<@${i.user.id}> at <t:${Math.floor(Date.now() / 1000)}:f>` });
+
+    await i.update({ embeds: [newEmbed], components: [] });
+    try {
+      const user = await client.users.fetch(rec.discord_id);
+      await user.send(
+        kind === 'order'
+          ? `Your order (${rec.amount} ${rec.currency}) was **${status}**.`
+          : `Your redemption (${rec.amount} ${rec.currency} → ${rec.username}) was **${status}**.`,
+      );
+    } catch {}
+    return;
+  }
+}
+
+async function sendPayPalPrompt(i, currency, amount, price) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`buy:confirm:${currency}:${amount}:${price.toFixed(2)}`).setLabel(`Confirm — pay ${fmtGBP(price)} via PayPal`).setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('buy:confirm:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
+  return i.update({
+    content: `**${amount.toLocaleString()} ${currency}** = **${fmtGBP(price)}** via PayPal\nLink: ${PAYPAL_LINK}\nClick confirm once you've paid (admin will verify).`,
+    components: [row],
+  });
+}
+
+async function handleModal(i) {
+  if (i.customId === 'modal:redeem:vbucks') {
+    const epic = i.fields.getTextInputValue('epic').trim();
+    const item = i.fields.getTextInputValue('item').trim();
+    const amount = parseInt(i.fields.getTextInputValue('amount').trim(), 10);
+    if (!Number.isFinite(amount) || amount <= 0) return ephem(i, 'Amount must be a positive number.');
+    const u = await getUser(i.user.id);
+    if (amount > u.vbucks_balance) return ephem(i, `You only have ${u.vbucks_balance} V-Bucks.`);
+    const { data: r } = await sb.from('redemptions').insert({
+      discord_id: i.user.id, currency: 'vbucks', amount, username: epic, item,
+    }).select('*').single();
+    await postRedemptionApproval(r, i.user.tag);
+    return ephem(i, `✅ Redemption submitted: **${amount}** V-Bucks for **${item}** to **${epic}**. Pending admin send.`);
+  }
+  if (i.customId === 'modal:redeem:robux') {
+    const username = i.fields.getTextInputValue('user').trim();
+    const amount = parseInt(i.fields.getTextInputValue('amount').trim(), 10);
+    if (!Number.isFinite(amount) || amount <= 0) return ephem(i, 'Amount must be a positive number.');
+    const u = await getUser(i.user.id);
+    if (amount > u.robux_balance) return ephem(i, `You only have ${u.robux_balance} Robux.`);
+    const { data: r } = await sb.from('redemptions').insert({
+      discord_id: i.user.id, currency: 'robux', amount, username,
+    }).select('*').single();
+    await postRedemptionApproval(r, i.user.tag);
+    return ephem(i, `✅ Redemption submitted: **${amount}** Robux to **${username}**. Pending admin send.`);
+  }
+}
+
+async function handleSelect() { /* unused */ }
+
+// ---------- boot ----------
+(async () => {
+  if (!DISCORD_TOKEN) {
+    console.warn('[warn] DISCORD_TOKEN not set — bot will not log in. HTTP server still running.');
+    return;
+  }
+  await registerCommands().catch(e => console.error('[discord] register failed', e));
+  await client.login(DISCORD_TOKEN);
+})();
